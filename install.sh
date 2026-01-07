@@ -38,7 +38,7 @@ NC='\033[0m' # No Color
 BINARY_NAME="agent-deck"
 INSTALL_DIR="${HOME}/.local/bin"
 VERSION="latest"
-REPO="asheshgoplani/agent-deck"
+REPO="Krudony/agent-deck-new"
 SKIP_TMUX_CONFIG=false
 SKIP_OPTIONAL_DEPS=false
 

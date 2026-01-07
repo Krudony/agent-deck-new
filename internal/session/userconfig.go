@@ -121,8 +121,8 @@ type ClaudeSettings struct {
 	ConfigDir string `toml:"config_dir"`
 
 	// DangerousMode enables --dangerously-skip-permissions flag for Claude sessions
-	// Default: false
-	DangerousMode bool `toml:"dangerous_mode"`
+	// Default: true (nil = use default true, explicitly set false to disable)
+	DangerousMode *bool `toml:"dangerous_mode"`
 }
 
 // GlobalSearchSettings defines global conversation search configuration

@@ -51,6 +51,10 @@ type Instance struct {
 	GeminiSessionID  string    `json:"gemini_session_id,omitempty"`
 	GeminiDetectedAt time.Time `json:"gemini_detected_at,omitempty"`
 
+	// Codex CLI integration
+	CodexSessionID  string    `json:"codex_session_id,omitempty"`
+	CodexDetectedAt time.Time `json:"codex_detected_at,omitempty"`
+
 	// MCP tracking - which MCPs were loaded when session started/restarted
 	// Used to detect pending MCPs (added after session start) and stale MCPs (removed but still running)
 	LoadedMCPNames []string `json:"loaded_mcp_names,omitempty"`
@@ -186,9 +190,11 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 	configDir := GetClaudeConfigDir()
 
 	// Check if dangerous mode is enabled in user config
-	dangerousMode := false
-	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil {
-		dangerousMode = userConfig.Claude.DangerousMode
+	// Default to true (always use --dangerously-skip-permissions)
+	dangerousMode := true
+	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil && userConfig.Claude.DangerousMode != nil {
+		// Use explicit value from config (nil = use default true)
+		dangerousMode = *userConfig.Claude.DangerousMode
 	}
 
 	// If baseCommand is just "claude", build the capture-resume command
@@ -240,11 +246,9 @@ func (i *Instance) buildClaudeCommandWithMessage(baseCommand, message string) st
 	return baseCommand
 }
 
-// buildGeminiCommand builds the gemini command with session capture
-// For new sessions: captures session ID via stream-json, stores in tmux env, then resumes
-// For sessions with known ID: uses simple resume
-// This ensures we always know the session ID for restart features
-// VERIFIED: gemini --output-format stream-json provides immediate session ID in first message
+// buildGeminiCommand builds the gemini command
+// For sessions with known ID: uses --resume to continue that session
+// For new sessions: starts fresh gemini (creates new session)
 func (i *Instance) buildGeminiCommand(baseCommand string) string {
 	if i.Tool != "gemini" {
 		return baseCommand
@@ -252,26 +256,15 @@ func (i *Instance) buildGeminiCommand(baseCommand string) string {
 
 	// If baseCommand is just "gemini", handle specially
 	if baseCommand == "gemini" {
-		// If we already have a session ID, use simple resume
+		// If we already have a session ID, resume it
 		if i.GeminiSessionID != "" {
 			return fmt.Sprintf("gemini --resume %s", i.GeminiSessionID)
 		}
 
-		// Build the capture-resume command for new sessions with fallback
-		// This command:
-		// 1. Runs Gemini with a minimal prompt "." to completion (saves session to disk)
-		// 2. Extracts session_id from the JSON output
-		// 3. Stores session ID in tmux environment (for retrieval by agent-deck)
-		// 4. Resumes that session interactively
-		// Fallback: If capture fails (jq not installed, auth issues), start Gemini fresh
-		// NOTE: Using --output-format json (not stream-json with head -1) because:
-		// - head -1 sends SIGPIPE which kills Gemini before it saves the session
-		// - json mode runs to completion, ensuring session file is written
-		return `session_id=$(gemini --output-format json "." 2>/dev/null | jq -r '.session_id' 2>/dev/null) || session_id=""; ` +
-			`if [ -n "$session_id" ] && [ "$session_id" != "null" ]; then ` +
-			`tmux set-environment GEMINI_SESSION_ID "$session_id"; ` +
-			`gemini --resume "$session_id"; ` +
-			`else gemini; fi`
+		// New session - start gemini normally
+		// Agent-deck will detect session ID from ~/.gemini files via UpdateGeminiSession
+		// Then R key will resume using that detected ID
+		return "gemini"
 	}
 
 	// For custom commands (e.g., resume commands), return as-is
@@ -505,6 +498,11 @@ func (i *Instance) UpdateStatus() error {
 		i.UpdateGeminiSession(nil)
 	}
 
+	// Update Codex session tracking (non-blocking, best-effort)
+	if i.Tool == "codex" {
+		i.UpdateCodexSession(nil)
+	}
+
 	return nil
 }
 
@@ -531,20 +529,58 @@ func (i *Instance) UpdateClaudeSession(excludeIDs map[string]bool) {
 // The capture-resume pattern (used in Start/Restart) sets GEMINI_SESSION_ID
 // in the tmux environment, making this the single authoritative source.
 //
-// No file scanning fallback - we rely on the consistent capture-resume pattern.
+// UpdateGeminiSession detects the Gemini session ID from files.
+// Scans ~/.gemini/tmp/<hash>/chats/ for the most recent session file.
 func (i *Instance) UpdateGeminiSession(excludeIDs map[string]bool) {
 	if i.Tool != "gemini" {
 		return
 	}
 
-	// Read from tmux environment (set by capture-resume pattern)
-	if i.tmuxSession != nil {
-		if sessionID, err := i.tmuxSession.GetEnvironment("GEMINI_SESSION_ID"); err == nil && sessionID != "" {
-			if i.GeminiSessionID != sessionID {
-				i.GeminiSessionID = sessionID
-			}
-			i.GeminiDetectedAt = time.Now()
+	// Always scan for the most recent session to handle cases where:
+	// - User started a new session but we still have old ID
+	// - Session ID changed but tmux env wasn't updated
+	// This ensures we always use the CURRENT session
+
+	// Scan for most recent session from files
+	sessions, err := ListGeminiSessions(i.ProjectPath)
+	if err != nil || len(sessions) == 0 {
+		return
+	}
+
+	// Use the most recent session (already sorted by LastUpdated)
+	for _, sess := range sessions {
+		// Skip excluded IDs
+		if excludeIDs != nil && excludeIDs[sess.SessionID] {
+			continue
 		}
+		i.GeminiSessionID = sess.SessionID
+		i.GeminiDetectedAt = time.Now()
+		return
+	}
+}
+
+// UpdateCodexSession updates the Codex session ID from files.
+// Scans ~/.codex/sessions/ for the most recent session file.
+func (i *Instance) UpdateCodexSession(excludeIDs map[string]bool) {
+	if i.Tool != "codex" {
+		return
+	}
+
+	// Always scan for the most recent session
+	sessions, err := ListCodexSessions()
+	if err != nil || len(sessions) == 0 {
+		return
+	}
+
+	// Use the most recent session (already sorted by LastUpdated)
+	for _, sess := range sessions {
+		// Skip excluded IDs
+		if excludeIDs != nil && excludeIDs[sess.SessionID] {
+			continue
+		}
+		i.CodexSessionID = sess.SessionID
+		i.CodexDetectedAt = time.Now()
+		return
 	}
 }
 
@@ -995,16 +1031,31 @@ func (i *Instance) Kill() error {
 }
 
 // Restart restarts the Claude session
-// For Claude sessions with known ID: sends Ctrl+C twice and resume command to existing session
+// For Claude/Gemini sessions with known ID: uses respawn-pane with resume command
 // For dead sessions or unknown ID: recreates the tmux session
 func (i *Instance) Restart() error {
-	log.Printf("[MCP-DEBUG] Instance.Restart() called - Tool=%s, ClaudeSessionID=%q, tmuxSession=%v, tmuxExists=%v",
-		i.Tool, i.ClaudeSessionID, i.tmuxSession != nil, i.tmuxSession != nil && i.tmuxSession.Exists())
+	log.Printf("[MCP-DEBUG] Instance.Restart() called - Tool=%s, ClaudeSessionID=%q, GeminiSessionID=%q, CodexSessionID=%q, tmuxSession=%v, tmuxExists=%v",
+		i.Tool, i.ClaudeSessionID, i.GeminiSessionID, i.CodexSessionID, i.tmuxSession != nil, i.tmuxSession != nil && i.tmuxSession.Exists())
 
 	// Regenerate .mcp.json before restart to use socket pool if available
 	// This ensures Claude picks up socket configs instead of stdio
 	if i.Tool == "claude" {
 		i.regenerateMCPConfig()
+	}
+
+	// If Gemini session with known ID AND tmux session exists, use respawn-pane
+	if i.Tool == "gemini" && i.GeminiSessionID != "" && i.tmuxSession != nil && i.tmuxSession.Exists() {
+		resumeCmd := fmt.Sprintf("gemini --resume %s", i.GeminiSessionID)
+		log.Printf("[MCP-DEBUG] Gemini respawn-pane with command: %s", resumeCmd)
+
+		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+			log.Printf("[MCP-DEBUG] Gemini RespawnPane failed: %v", err)
+			return fmt.Errorf("failed to restart Gemini session: %w", err)
+		}
+
+		log.Printf("[MCP-DEBUG] Gemini RespawnPane succeeded")
+		i.Status = StatusWaiting
+		return nil
 	}
 
 	// If Claude session with known ID AND tmux session exists, use respawn-pane
@@ -1031,6 +1082,21 @@ func (i *Instance) Restart() error {
 		return nil
 	}
 
+	// If Codex session with known ID AND tmux session exists, use respawn-pane
+	if i.Tool == "codex" && i.CodexSessionID != "" && i.tmuxSession != nil && i.tmuxSession.Exists() {
+		resumeCmd := fmt.Sprintf("codex resume %s", i.CodexSessionID)
+		log.Printf("[MCP-DEBUG] Codex respawn-pane with command: %s", resumeCmd)
+
+		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
+			log.Printf("[MCP-DEBUG] Codex RespawnPane failed: %v", err)
+			return fmt.Errorf("failed to restart Codex session: %w", err)
+		}
+
+		log.Printf("[MCP-DEBUG] Codex RespawnPane succeeded")
+		i.Status = StatusWaiting
+		return nil
+	}
+
 	log.Printf("[MCP-DEBUG] Using fallback: recreate tmux session")
 
 	// Fallback: recreate tmux session (for dead sessions or unknown ID)
@@ -1043,6 +1109,8 @@ func (i *Instance) Restart() error {
 		// Set GEMINI_SESSION_ID in tmux env so detection works after restart
 		command = fmt.Sprintf("tmux set-environment GEMINI_SESSION_ID %s && gemini --resume %s",
 			i.GeminiSessionID, i.GeminiSessionID)
+	} else if i.Tool == "codex" && i.CodexSessionID != "" {
+		command = fmt.Sprintf("codex resume %s", i.CodexSessionID)
 	} else {
 		// Route to appropriate command builder based on tool
 		switch i.Tool {
@@ -1084,9 +1152,11 @@ func (i *Instance) buildClaudeResumeCommand() string {
 	configDir := GetClaudeConfigDir()
 
 	// Check if dangerous mode is enabled in user config
-	dangerousMode := false
-	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil {
-		dangerousMode = userConfig.Claude.DangerousMode
+	// Default to true (always use --dangerously-skip-permissions)
+	dangerousMode := true
+	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil && userConfig.Claude.DangerousMode != nil {
+		// Use explicit value from config (nil = use default true)
+		dangerousMode = *userConfig.Claude.DangerousMode
 	}
 
 	// Build the command with tmux environment update
@@ -1112,6 +1182,11 @@ func (i *Instance) CanRestart() bool {
 
 	// Claude sessions with known session ID can always be restarted
 	if i.Tool == "claude" && i.ClaudeSessionID != "" {
+		return true
+	}
+
+	// Codex sessions with known session ID can always be restarted
+	if i.Tool == "codex" && i.CodexSessionID != "" {
 		return true
 	}
 
@@ -1145,9 +1220,9 @@ func (i *Instance) Fork(newTitle, newGroupPath string) (string, error) {
 	configDir := GetClaudeConfigDir()
 
 	// Check dangerous mode from user config (same logic as buildClaudeResumeCommand)
-	dangerousMode := false
-	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil {
-		dangerousMode = userConfig.Claude.DangerousMode
+	dangerousMode := true
+	if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil && userConfig.Claude.DangerousMode != nil {
+		dangerousMode = *userConfig.Claude.DangerousMode
 	}
 
 	// Build dangerous mode flag

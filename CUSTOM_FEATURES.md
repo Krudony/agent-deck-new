@@ -170,7 +170,7 @@ if userConfig, err := LoadUserConfig(); err == nil && userConfig != nil && userC
 }
 ```
 
-**Location B: buildClaudeResumeCommand()** (line ~1223-1226)
+**Location B: buildClaudeResumeCommand()** (line ~1154-1160)
 ```go
 // Same pattern as Location A
 dangerousMode := true
